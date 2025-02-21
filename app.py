@@ -42,6 +42,10 @@ EXTRACTUOUS_API_URL = "https://api.extractous.com/v1/extract"
 LLMWHISPERER_API_KEY = os.getenv('LLMWHISPERER_API_KEY', 'kXGTWL0B2_sB3kb1SysX_ziPDlRfj3RqN3U6E5s4CRw')
 LLMWHISPERER_BASE_URL = "https://llmwhisperer-api.us-central.unstract.com/api/v2"
 
+# Add Together AI configuration
+TOGETHER_API_KEY = os.getenv('TOGETHER_API_KEY', '595787d329aeb19c7c39a6fa5a63945b765cfb47803f3ce475601740e54ecbc0')
+TOGETHER_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free"
+
 def test_lambda_api():
     """Test Lambda API connection"""
     try:
@@ -1080,6 +1084,170 @@ def get_final_answer(query: str, sql_answer: str = None, pdf_answer: str = None)
     except Exception as e:
         return f"Error generating final answer: {str(e)}"
 
+def analyze_query_complexity(query: str) -> dict:
+    """Use LLAMA to determine if query is complex"""
+    try:
+        prompt = f"""You are a query analyzer. Given this query, determine if it's complex or simple.
+        
+        Query: {query}
+        
+        A query is complex if it:
+        1. Contains multiple questions
+        2. Requires information from multiple sources
+        3. Has dependencies between parts
+        
+        Respond with EXACTLY this JSON format (no other text):
+        {{
+            "is_complex": true/false,
+            "reason": "brief explanation"
+        }}
+        
+        Example response:
+        {{
+            "is_complex": false,
+            "reason": "Single question about room data"
+        }}"""
+        
+        # Get raw response from LLAMA
+        response = st.session_state['llm_wrapper'](prompt)
+        
+        # Clean the response to extract just the JSON part
+        json_str = response
+        if '```json' in response:
+            json_str = response.split('```json')[1].split('```')[0]
+        elif '```' in response:
+            json_str = response.split('```')[1].split('```')[0]
+            
+        # Strip any extra whitespace or newlines
+        json_str = json_str.strip()
+        
+        # Parse the JSON
+        result = json.loads(json_str)
+        
+        # Validate required fields
+        if not isinstance(result, dict) or 'is_complex' not in result or 'reason' not in result:
+            raise ValueError("Invalid response format")
+            
+        return result
+        
+    except Exception as e:
+        st.error(f"Error in complexity analysis: {str(e)}")
+        return {
+            "is_complex": False,
+            "reason": "Error in analysis, treating as simple query"
+        }
+
+def decompose_complex_query(query: str) -> dict:
+    """Use DeepSeek to break down complex queries"""
+    try:
+        # Initialize Together client with API key
+        client = Together(api_key=TOGETHER_API_KEY)
+        prompt = f"""Break down this complex query into parts:
+        Query: {query}
+        
+        Return a JSON with this structure:
+        {{
+            "sub_queries": [
+                {{"query": "sub-question 1", "order": 1}},
+                {{"query": "sub-question 2", "order": 2}}
+            ],
+            "execution_type": "sequential" or "parallel",
+            "dependencies": [] // for sequential queries
+        }}"""
+
+        response = client.chat.completions.create(
+            model=TOGETHER_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        # Extract and parse JSON from response
+        result = response.choices[0].message.content
+        
+        # Clean and parse JSON similar to complexity analyzer
+        json_str = result
+        if '```json' in result:
+            json_str = result.split('```json')[1].split('```')[0]
+        elif '```' in result:
+            json_str = result.split('```')[1].split('```')[0]
+            
+        json_str = json_str.strip()
+        parsed_result = json.loads(json_str)
+        
+        # Validate structure
+        if not isinstance(parsed_result, dict) or 'sub_queries' not in parsed_result or 'execution_type' not in parsed_result:
+            raise ValueError("Invalid response format")
+            
+        return parsed_result
+        
+    except Exception as e:
+        st.error(f"Error in query decomposition: {str(e)}")
+        return {
+            "sub_queries": [{"query": query, "order": 1}],
+            "execution_type": "sequential",
+            "dependencies": []
+        }
+
+def process_query_parts(decomposed_query: dict) -> str:
+    """Process sub-queries based on execution type"""
+    try:
+        results = []
+        
+        if decomposed_query['execution_type'] == 'sequential':
+            # Process queries in order
+            for sub_query in sorted(decomposed_query['sub_queries'], key=lambda x: x['order']):
+                query_type = determine_query_type(sub_query['query'])
+                st.write(f"🔍 Processing Sub-Query: {sub_query['query']}")
+                st.write(f"📊 Query Type: {query_type}")
+                
+                sql_answer = None
+                pdf_answer = None
+                
+                if query_type in ['SQL', 'BOTH']:
+                    sql_answer = get_sql_answer(sub_query['query'])
+                if query_type in ['PDF', 'BOTH']:
+                    pdf_answer = get_pdf_answer(sub_query['query'])
+                
+                result = get_final_answer(sub_query['query'], sql_answer, pdf_answer)
+                results.append(result)
+                
+        else:  # parallel
+            # Process all queries simultaneously
+            for sub_query in decomposed_query['sub_queries']:
+                query_type = determine_query_type(sub_query['query'])
+                st.write(f"🔍 Processing Sub-Query: {sub_query['query']}")
+                st.write(f"📊 Query Type: {query_type}")
+                
+                sql_answer = None
+                pdf_answer = None
+                
+                if query_type in ['SQL', 'BOTH']:
+                    sql_answer = get_sql_answer(sub_query['query'])
+                if query_type in ['PDF', 'BOTH']:
+                    pdf_answer = get_pdf_answer(sub_query['query'])
+                
+                result = get_final_answer(sub_query['query'], sql_answer, pdf_answer)
+                results.append(result)
+        
+        # Combine results
+        combined_results = "\n".join(results)
+        return get_final_combined_answer(combined_results)
+    except Exception as e:
+        st.error(f"Error processing query parts: {str(e)}")
+        return "Error processing query parts"
+
+def get_final_combined_answer(results: str) -> str:
+    """Generate final combined answer from all results"""
+    try:
+        prompt = f"""Combine these results into a clear, coherent answer:
+        Results: {results}
+        
+        Provide a natural, flowing response that addresses all parts of the original question."""
+        
+        return st.session_state['llm_wrapper'](prompt)
+    except Exception as e:
+        st.error(f"Error combining results: {str(e)}")
+        return "Error generating final answer"
+
 def main():
     st.title("🏭 Warehouse Data Analysis Assistant")
     
@@ -1164,20 +1332,62 @@ def main():
         user_query = st.text_input("❓ What would you like to know?")
         
         if user_query:
-            query_type = determine_query_type(user_query)
-            st.write(f"🔍 Query Type: {query_type}")
+            # Initialize final_answer
+            final_answer = None
             
-            sql_answer = None
-            pdf_answer = None
+            # Step 1: Analyze complexity
+            st.write("🤔 Analyzing query complexity...")
+            complexity_analysis = analyze_query_complexity(user_query)
+            st.write(f"📊 Complexity Analysis: {complexity_analysis['reason']}")
             
-            if query_type in ['SQL', 'BOTH']:
-                sql_answer = get_sql_answer(user_query)
-            
-            if query_type in ['PDF', 'BOTH']:
-                pdf_answer = get_pdf_answer(user_query)
-            
-            final_answer = get_final_answer(user_query, sql_answer, pdf_answer)
-            st.write("💡 Answer:", final_answer)
+            try:
+                if complexity_analysis['is_complex']:
+                    # Step 2: Decompose complex query
+                    st.write("🔄 Breaking down complex query...")
+                    decomposed = decompose_complex_query(user_query)
+                    
+                    if decomposed:  # Add null check
+                        st.write("📋 Query Breakdown:", decomposed.get('execution_type', 'SEQUENTIAL').upper())
+                        # Step 3: Process parts
+                        final_answer = process_query_parts(decomposed)
+                    else:
+                        # Fallback to simple query processing if decomposition fails
+                        query_type = determine_query_type(user_query)
+                        st.write(f"🔍 Query Type: {query_type}")
+                        
+                        sql_answer = None
+                        pdf_answer = None
+                        
+                        if query_type in ['SQL', 'BOTH']:
+                            sql_answer = get_sql_answer(user_query)
+                        if query_type in ['PDF', 'BOTH']:
+                            pdf_answer = get_pdf_answer(user_query)
+                        
+                        final_answer = get_final_answer(user_query, sql_answer, pdf_answer)
+                else:
+                    # Process simple query
+                    query_type = determine_query_type(user_query)
+                    st.write(f"🔍 Query Type: {query_type}")
+                    
+                    sql_answer = None
+                    pdf_answer = None
+                    
+                    if query_type in ['SQL', 'BOTH']:
+                        sql_answer = get_sql_answer(user_query)
+                    if query_type in ['PDF', 'BOTH']:
+                        pdf_answer = get_pdf_answer(user_query)
+                    
+                    final_answer = get_final_answer(user_query, sql_answer, pdf_answer)
+                
+                # Display final answer if we have one
+                if final_answer:
+                    st.write("💡 Final Answer:", final_answer)
+                else:
+                    st.error("Unable to generate an answer. Please try rephrasing your question.")
+                    
+            except Exception as e:
+                st.error(f"Error processing query: {str(e)}")
+                st.error("Please try rephrasing your question or contact support if the issue persists.")
 
 if __name__ == "__main__":
     main()
